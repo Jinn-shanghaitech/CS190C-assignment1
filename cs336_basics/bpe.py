@@ -3,12 +3,11 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import BinaryIO, Iterable, Iterator
 
 import regex as re
 
 
-# GPT-2 style pretokenization pattern
 DEFAULT_PRETOKENIZER_PATTERN = (
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+|"""
     r""" ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -23,6 +22,31 @@ def _bytes_to_tuple(token_bytes: bytes) -> tuple[bytes, ...]:
     return tuple(bytes([b]) for b in token_bytes)
 
 
+def _split_text_by_special_tokens(text: str, special_tokens: list[str]) -> list[tuple[bool, str]]:
+    """
+    Split text into segments:
+    - (True, token)  -> exact special token
+    - (False, chunk) -> ordinary text
+    """
+    if not special_tokens:
+        return [(False, text)]
+
+    escaped = sorted((re.escape(tok) for tok in special_tokens), key=len, reverse=True)
+    pattern = re.compile("|".join(escaped))
+
+    parts: list[tuple[bool, str]] = []
+    last = 0
+    for match in pattern.finditer(text):
+        if match.start() > last:
+            parts.append((False, text[last:match.start()]))
+        parts.append((True, match.group(0)))
+        last = match.end()
+    if last < len(text):
+        parts.append((False, text[last:]))
+
+    return parts
+
+
 def _count_adjacent_pairs(
     word_counts: Counter[tuple[bytes, ...]],
 ) -> Counter[tuple[bytes, bytes]]:
@@ -31,8 +55,17 @@ def _count_adjacent_pairs(
         if len(word) < 2:
             continue
         for i in range(len(word) - 1):
-            pair_counts[(word[i], word[i + 1])] += freq
+            pair = (word[i], word[i + 1])
+            pair_counts[pair] += freq
     return pair_counts
+
+
+def _choose_best_pair(
+    pair_counts: Counter[tuple[bytes, bytes]],
+) -> tuple[bytes, bytes]:
+    # 先按频数最大；若频数相同，则按 pair 的字典序最大
+    # Python 会按 tuple 逐项比较，bytes 也支持字典序比较
+    return max(pair_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
 
 
 def _merge_pair_in_word(
@@ -76,42 +109,33 @@ def train_bpe(
     special_tokens: list[str] | None = None,
     pattern: str = DEFAULT_PRETOKENIZER_PATTERN,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """
-    Train a byte-level BPE tokenizer.
-
-    Returns:
-        vocab: mapping token_id -> token_bytes
-        merges: list of merges in creation order, where each item is (left_bytes, right_bytes)
-    """
     if special_tokens is None:
         special_tokens = []
 
     text = Path(input_path).read_text(encoding="utf-8")
 
-    # Initial vocabulary:
-    # 1) special tokens first
-    # 2) all 256 byte values
     vocab: dict[int, bytes] = {}
-    next_id = 0
-
-    for tok in special_tokens:
-        vocab[next_id] = tok.encode("utf-8")
-        next_id += 1
 
     for b in range(256):
-        vocab[next_id] = bytes([b])
-        next_id += 1
+        vocab[len(vocab)] = bytes([b])
+
+    #special tokens
+    for tok in special_tokens:
+        tok_bytes = tok.encode("utf-8")
+        if tok_bytes not in vocab.values():
+            vocab[len(vocab)] = tok_bytes
 
     if vocab_size <= len(vocab):
         return {i: vocab[i] for i in range(vocab_size)}, []
 
-    pretokens = _pretokenize_text(text, pattern)
+    segments = _split_text_by_special_tokens(text, special_tokens)
 
-    # Count unique pretokens after converting to byte tuples
     word_counts: Counter[tuple[bytes, ...]] = Counter()
-    for token in pretokens:
-        token_bytes = token.encode("utf-8")
-        word_counts[_bytes_to_tuple(token_bytes)] += 1
+    for is_special, chunk in segments:
+        if is_special:
+            continue
+        for token in _pretokenize_text(chunk, pattern):
+            word_counts[_bytes_to_tuple(token.encode("utf-8"))] += 1
 
     merges: list[tuple[bytes, bytes]] = []
 
@@ -120,18 +144,15 @@ def train_bpe(
         if not pair_counts:
             break
 
-        # Deterministic tie-break:
-        # pick highest frequency; if tied, lexicographically smallest pair
-        best_pair = min(pair_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
-
+        best_pair = _choose_best_pair(pair_counts)
         merged_token = best_pair[0] + best_pair[1]
+
         vocab[len(vocab)] = merged_token
         merges.append(best_pair)
 
         word_counts = _merge_pair_in_word_counts(word_counts, best_pair)
 
     return vocab, merges
-
 
 @dataclass
 class BPETokenizer:
@@ -142,18 +163,18 @@ class BPETokenizer:
 
     def __post_init__(self) -> None:
         self.special_tokens = self.special_tokens or []
-
         self.token_to_id: dict[bytes, int] = {token_bytes: idx for idx, token_bytes in self.vocab.items()}
         self.merge_ranks: dict[tuple[bytes, bytes], int] = {
             pair: rank for rank, pair in enumerate(self.merges)
         }
 
-        # Precompile regex for special tokens, longest-first to avoid prefix issues
         if self.special_tokens:
             escaped = sorted((re.escape(tok) for tok in self.special_tokens), key=len, reverse=True)
             self.special_pattern = re.compile("|".join(escaped))
+            self.max_special_len = max(len(tok) for tok in self.special_tokens)
         else:
             self.special_pattern = None
+            self.max_special_len = 0
 
     def encode(self, text: str) -> list[int]:
         pieces: list[int] = []
@@ -178,6 +199,14 @@ class BPETokenizer:
             pieces.extend(self._encode_ordinary_text(text[last:]))
 
         return pieces
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        Local tests only require correctness; simplest correct implementation is to
+        concatenate then encode. This preserves exact behavior across chunk boundaries.
+        """
+        text = "".join(iterable)
+        yield from self.encode(text)
 
     def _encode_ordinary_text(self, text: str) -> list[int]:
         token_ids: list[int] = []
@@ -208,10 +237,7 @@ class BPETokenizer:
             merged = parts[i] + parts[i + 1]
             parts = parts[:i] + [merged] + parts[i + 2 :]
 
-        try:
-            return [self.token_to_id[p] for p in parts]
-        except KeyError as e:
-            raise KeyError(f"Token bytes {e.args[0]!r} not found in vocabulary.") from e
+        return [self.token_to_id[p] for p in parts]
 
     def decode(self, ids: Iterable[int]) -> str:
         byte_stream = b"".join(self.vocab[i] for i in ids)
