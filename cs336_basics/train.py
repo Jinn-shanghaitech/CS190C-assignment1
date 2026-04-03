@@ -14,10 +14,7 @@ from cs336_basics.checkpoint import save_checkpoint
 
 
 def build_tokenizer(text_path: str, vocab_size: int = 256):
-    """
-    这里假设你 Part B 的 train_bpe 返回 (vocab, merges)。
-    如果你的 train_bpe 返回格式不一样，你把这一小段改成你自己的版本即可。
-    """
+
     vocab, merges = train_bpe(
         input_path=text_path,
         vocab_size=vocab_size,
